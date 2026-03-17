@@ -65,7 +65,37 @@ class QQOfficialMessageEvent(AstrMessageEvent):
         self.bot = bot
         self.send_buffer = None
 
+    @staticmethod
+    def _is_supported_raw_message(source: object) -> bool:
+        return isinstance(
+            source,
+            botpy.message.Message
+            | botpy.message.GroupMessage
+            | botpy.message.DirectMessage
+            | botpy.message.C2CMessage,
+        )
+
+    async def _send_via_session_fallback(self, message: MessageChain) -> None:
+        platform = getattr(self.bot, "platform", None)
+        if platform is None:
+            logger.warning(
+                "[QQOfficial] Missing platform reference, cannot fallback to send_by_session"
+            )
+            return
+
+        logger.warning(
+            "[QQOfficial] raw_message is %s, fallback to send_by_session for %s",
+            type(self.message_obj.raw_message),
+            self.session,
+        )
+        await platform.send_by_session(self.session, message)
+
     async def send(self, message: MessageChain) -> None:
+        source = self.message_obj.raw_message
+        if not self._is_supported_raw_message(source):
+            await super().send(message)
+            await self._send_via_session_fallback(message)
+            return
         self.send_buffer = message
         await self._post_send()
 
@@ -553,7 +583,7 @@ class QQOfficialMessageEvent(AstrMessageEvent):
         markdown: message.MarkdownPayload | None = None,
         keyboard: message.Keyboard | None = None,
         stream: dict | None = None,
-    ) -> message.Message:
+    ) -> message.Message | None:
         payload = locals()
         payload.pop("self", None)
         # QQ API does not accept stream.id=None; remove it when not yet assigned
