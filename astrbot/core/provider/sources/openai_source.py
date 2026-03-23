@@ -123,6 +123,18 @@ class ProviderOpenAIOfficial(Provider):
         return False
 
     @staticmethod
+    def _requires_streaming_chat_completion(error: Exception) -> bool:
+        candidates = [
+            candidate.lower()
+            for candidate in ProviderOpenAIOfficial._extract_error_text_candidates(
+                error
+            )
+        ]
+        return any(
+            "stream must be set to true" in candidate for candidate in candidates
+        )
+
+    @staticmethod
     def _context_contains_image(contexts: list[dict]) -> bool:
         for context in contexts:
             content = context.get("content")
@@ -327,6 +339,11 @@ class ProviderOpenAIOfficial(Provider):
         llm_response = LLMResponse("assistant", is_chunk=True)
 
         state = ChatCompletionStreamState()
+        accumulated_text = ""
+        accumulated_reasoning = ""
+        tool_call_state: dict[str, dict[str, Any]] = {}
+        response_id = None
+        usage = None
 
         async for chunk in stream:
             if not chunk.choices:
@@ -348,27 +365,52 @@ class ProviderOpenAIOfficial(Provider):
             reasoning = self._extract_reasoning_content(chunk)
             _y = False
             llm_response.id = chunk.id
+            response_id = chunk.id
             if reasoning:
+                accumulated_reasoning += reasoning
                 llm_response.reasoning_content = reasoning
                 _y = True
             if delta and delta.content:
                 # Don't strip streaming chunks to preserve spaces between words
                 completion_text = self._normalize_content(delta.content, strip=False)
+                accumulated_text += completion_text
                 llm_response.result_chain = MessageChain(
                     chain=[Comp.Plain(completion_text)],
                 )
                 _y = True
+            tool_calls = getattr(delta, "tool_calls", None) if delta else None
+            if tool_calls:
+                for tool_call in tool_calls:
+                    self._merge_tool_call_chunk(tool_call_state, tool_call)
             if chunk.usage:
-                llm_response.usage = self._extract_usage(chunk.usage)
+                usage = self._extract_usage(chunk.usage)
+                llm_response.usage = usage
             elif choice_usage := getattr(choice, "usage", None):
                 # Workaround for some providers that only return usage in choices[].usage, e.g. MoonshotAI
                 # See https://github.com/AstrBotDevs/AstrBot/issues/6614
-                llm_response.usage = self._extract_usage(choice_usage)
+                usage = self._extract_usage(choice_usage)
+                llm_response.usage = usage
                 state.current_completion_snapshot.usage = choice_usage
             if _y:
                 yield llm_response
 
-        final_completion = state.get_final_completion()
+        try:
+            final_completion = state.get_final_completion()
+        except Exception as exc:
+            logger.warning(
+                "Failed to build final completion from streaming state; using chunk aggregation fallback: %s",
+                exc,
+            )
+            llm_response = self._build_fallback_stream_response(
+                response_id=response_id,
+                completion_text=accumulated_text,
+                reasoning_content=accumulated_reasoning,
+                tool_call_state=tool_call_state,
+                usage=usage,
+            )
+            yield llm_response
+            return
+
         llm_response = await self._parse_openai_completion(final_completion, tools)
 
         yield llm_response
@@ -392,6 +434,97 @@ class ProviderOpenAIOfficial(Provider):
             if reasoning_attr:
                 reasoning_text = str(reasoning_attr)
         return reasoning_text
+
+    @staticmethod
+    def _merge_tool_call_chunk(
+        tool_call_state: dict[str, dict[str, Any]],
+        tool_call: Any,
+    ) -> None:
+        tool_call_id = getattr(tool_call, "id", None)
+        order = getattr(tool_call, "index", 0) or 0
+        if not tool_call_id:
+            tool_call_id = f"index:{order}"
+
+        state = tool_call_state.setdefault(
+            tool_call_id,
+            {
+                "id": tool_call_id,
+                "name": "",
+                "arguments": "",
+                "extra_content": None,
+                "order": order,
+            },
+        )
+        state["order"] = order
+
+        function = getattr(tool_call, "function", None)
+        if function is not None:
+            func_name = getattr(function, "name", None)
+            if func_name:
+                state["name"] = func_name
+            func_args = getattr(function, "arguments", None)
+            if isinstance(func_args, str) and func_args:
+                state["arguments"] += func_args
+
+        extra_content = getattr(tool_call, "extra_content", None)
+        if extra_content is not None:
+            state["extra_content"] = extra_content
+
+    @staticmethod
+    def _build_fallback_stream_response(
+        *,
+        response_id: str | None,
+        completion_text: str,
+        reasoning_content: str,
+        tool_call_state: dict[str, dict[str, Any]],
+        usage: TokenUsage | None,
+    ) -> LLMResponse:
+        llm_response = LLMResponse("assistant", is_chunk=False)
+        llm_response.id = response_id
+        if usage is not None:
+            llm_response.usage = usage
+        if reasoning_content:
+            llm_response.reasoning_content = reasoning_content
+
+        ordered_tool_calls = sorted(
+            tool_call_state.values(),
+            key=lambda item: item.get("order", 0),
+        )
+        if ordered_tool_calls:
+            llm_response.role = "tool"
+            llm_response.tools_call_args = []
+            llm_response.tools_call_name = []
+            llm_response.tools_call_ids = []
+            llm_response.tools_call_extra_content = {}
+            for item in ordered_tool_calls:
+                raw_arguments = item.get("arguments", "")
+                parsed_arguments: dict[str, Any] = {}
+                if raw_arguments:
+                    try:
+                        parsed_arguments = json.loads(raw_arguments)
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            "Failed to parse streaming tool call arguments for %s: %s",
+                            item.get("name") or item.get("id"),
+                            raw_arguments,
+                        )
+                        parsed_arguments = {"__raw_arguments": raw_arguments}
+                item_id = str(item.get("id", ""))
+                llm_response.tools_call_args.append(parsed_arguments)
+                llm_response.tools_call_name.append(str(item.get("name", "")))
+                llm_response.tools_call_ids.append(item_id)
+                extra_content = item.get("extra_content")
+                if extra_content is not None:
+                    llm_response.tools_call_extra_content[item_id] = extra_content
+
+        if completion_text:
+            llm_response.result_chain = MessageChain(
+                chain=[Comp.Plain(completion_text)]
+            )
+        elif not llm_response.tools_call_args and not reasoning_content:
+            llm_response.result_chain = MessageChain(chain=[Comp.Plain(" ")])
+
+        return llm_response
 
     def _extract_usage(self, usage: CompletionUsage | dict) -> TokenUsage:
         ptd = getattr(usage, "prompt_tokens_details", None)
@@ -579,6 +712,18 @@ class ProviderOpenAIOfficial(Provider):
         if completion.usage:
             llm_response.usage = self._extract_usage(completion.usage)
 
+        return llm_response
+
+    async def _collect_streaming_query(
+        self,
+        payloads: dict,
+        func_tool: ToolSet | None,
+    ) -> LLMResponse:
+        llm_response = None
+        async for response in self._query_stream(payloads, func_tool):
+            llm_response = response
+        if llm_response is None:
+            raise Exception("流式响应为空")
         return llm_response
 
     async def _prepare_chat_payload(
@@ -781,12 +926,27 @@ class ProviderOpenAIOfficial(Provider):
 
         last_exception = None
         retry_cnt = 0
+        force_stream = bool(
+            self.provider_config.get("force_stream_for_chat_completions", False)
+        )
         for retry_cnt in range(max_retries):
             try:
                 self.client.api_key = chosen_key
-                llm_response = await self._query(payloads, func_tool)
+                if force_stream:
+                    llm_response = await self._collect_streaming_query(
+                        payloads,
+                        func_tool,
+                    )
+                else:
+                    llm_response = await self._query(payloads, func_tool)
                 break
             except Exception as e:
+                if not force_stream and self._requires_streaming_chat_completion(e):
+                    logger.warning(
+                        "Provider requires stream=true for chat completions; retrying with streaming mode."
+                    )
+                    force_stream = True
+                    continue
                 last_exception = e
                 (
                     success,

@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from openai.types.chat.chat_completion import ChatCompletion
@@ -234,7 +235,9 @@ async def test_openai_payload_keeps_reasoning_content_in_assistant_history():
         provider._finally_convert_payload(payloads)
 
         assistant_message = payloads["messages"][0]
-        assert assistant_message["content"] == [{"type": "text", "text": "final answer"}]
+        assert assistant_message["content"] == [
+            {"type": "text", "text": "final answer"}
+        ]
         assert assistant_message["reasoning_content"] == "step 1"
     finally:
         await provider.terminate()
@@ -259,7 +262,9 @@ async def test_groq_payload_drops_reasoning_content_from_assistant_history():
         provider._finally_convert_payload(payloads)
 
         assistant_message = payloads["messages"][0]
-        assert assistant_message["content"] == [{"type": "text", "text": "final answer"}]
+        assert assistant_message["content"] == [
+            {"type": "text", "text": "final answer"}
+        ]
         assert "reasoning_content" not in assistant_message
         assert "reasoning" not in assistant_message
     finally:
@@ -533,3 +538,149 @@ async def test_query_injects_reasoning_effort_none_for_ollama(monkeypatch):
         assert extra_body["temperature"] == 0.1
     finally:
         await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_text_chat_uses_streaming_when_force_stream_enabled():
+    provider = _make_provider({"force_stream_for_chat_completions": True})
+    try:
+        expected_response = SimpleNamespace(completion_text="streamed response")
+        provider._prepare_chat_payload = AsyncMock(
+            return_value=({"messages": [{"role": "user", "content": "hello"}]}, [])
+        )
+
+        async def fake_collect_streaming_query(payloads, func_tool):
+            assert payloads == {"messages": [{"role": "user", "content": "hello"}]}
+            assert func_tool is None
+            return expected_response
+
+        provider._collect_streaming_query = AsyncMock(
+            side_effect=fake_collect_streaming_query
+        )
+        provider._query = AsyncMock(
+            side_effect=AssertionError("_query should not be called")
+        )
+
+        response = await provider.text_chat(prompt="hello")
+
+        assert response is expected_response
+        provider._collect_streaming_query.assert_awaited_once()
+        provider._query.assert_not_awaited()
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_text_chat_falls_back_to_streaming_when_provider_requires_it():
+    provider = _make_provider()
+    try:
+        expected_response = SimpleNamespace(completion_text="stream fallback response")
+        provider._prepare_chat_payload = AsyncMock(
+            return_value=({"messages": [{"role": "user", "content": "hello"}]}, [])
+        )
+        provider._query = AsyncMock(
+            side_effect=[
+                Exception("Error code: 400 - {'detail': 'Stream must be set to true'}")
+            ]
+        )
+        provider._collect_streaming_query = AsyncMock(return_value=expected_response)
+
+        response = await provider.text_chat(prompt="hello")
+
+        assert response is expected_response
+        provider._query.assert_awaited_once()
+        provider._collect_streaming_query.assert_awaited_once()
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_requires_streaming_chat_completion_detects_provider_error():
+    provider = _make_provider()
+    try:
+        assert provider._requires_streaming_chat_completion(
+            Exception("Error code: 400 - {'detail': 'Stream must be set to true'}")
+        )
+        assert not provider._requires_streaming_chat_completion(
+            Exception("some other provider error")
+        )
+    finally:
+        await provider.terminate()
+
+
+@pytest.mark.asyncio
+async def test_query_stream_falls_back_when_final_completion_snapshot_missing():
+    provider = _make_provider()
+    try:
+        delta = SimpleNamespace(content="hello ", tool_calls=None)
+        chunk = SimpleNamespace(
+            id="chunk-1",
+            choices=[SimpleNamespace(delta=delta)],
+            usage=None,
+        )
+
+        class _BrokenState:
+            def handle_chunk(self, _chunk):
+                return None
+
+            def get_final_completion(self):
+                raise AssertionError("snapshot missing")
+
+        async def fake_stream():
+            yield chunk
+
+        provider.client.chat.completions.create = AsyncMock(return_value=fake_stream())
+        provider._parse_openai_completion = AsyncMock(
+            side_effect=AssertionError("should not parse final completion")
+        )
+
+        original_state = ProviderOpenAIOfficial._query_stream.__globals__[
+            "ChatCompletionStreamState"
+        ]
+        ProviderOpenAIOfficial._query_stream.__globals__[
+            "ChatCompletionStreamState"
+        ] = _BrokenState
+        try:
+            responses = [
+                response
+                async for response in provider._query_stream(
+                    {"messages": [{"role": "user", "content": "hello"}]},
+                    None,
+                )
+            ]
+        finally:
+            ProviderOpenAIOfficial._query_stream.__globals__[
+                "ChatCompletionStreamState"
+            ] = original_state
+
+        assert len(responses) == 2
+        assert responses[0].is_chunk is True
+        assert responses[0].completion_text == "hello "
+        assert responses[1].is_chunk is False
+        assert responses[1].completion_text == "hello "
+        provider._parse_openai_completion.assert_not_awaited()
+    finally:
+        await provider.terminate()
+
+
+def test_build_fallback_stream_response_preserves_tool_calls():
+    response = ProviderOpenAIOfficial._build_fallback_stream_response(
+        response_id="resp-1",
+        completion_text="",
+        reasoning_content="",
+        tool_call_state={
+            "call-1": {
+                "id": "call-1",
+                "name": "astrbot_execute_shell",
+                "arguments": '{"command":"cmd /c echo astrbot_shell_ok"}',
+                "extra_content": None,
+                "order": 0,
+            }
+        },
+        usage=None,
+    )
+
+    assert response.role == "tool"
+    assert response.tools_call_name == ["astrbot_execute_shell"]
+    assert response.tools_call_ids == ["call-1"]
+    assert response.tools_call_args == [{"command": "cmd /c echo astrbot_shell_ok"}]
